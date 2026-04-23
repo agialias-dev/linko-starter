@@ -12,8 +12,21 @@ import (
 	"syscall"
 	"time"
 
+	pkgerr "github.com/pkg/errors"
+
+	"boot.dev/linko/internal/linkoerr"
 	"boot.dev/linko/internal/store"
 )
+
+type stackTracer interface {
+	error
+	StackTrace() pkgerr.StackTrace
+}
+
+type multiError interface {
+	error
+	Unwrap() []error
+}
 
 func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -71,7 +84,8 @@ type closeFunc func() error
 func initializeLogger(logFile string) (*slog.Logger, closeFunc, error) {
 	handlers := []slog.Handler{
 		slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
-			Level: slog.LevelDebug,
+			Level:       slog.LevelDebug,
+			ReplaceAttr: replaceAttr,
 		}),
 	}
 	closers := []closeFunc{}
@@ -92,7 +106,8 @@ func initializeLogger(logFile string) (*slog.Logger, closeFunc, error) {
 			return nil
 		}
 		handlers = append(handlers, slog.NewJSONHandler(bufferedFile, &slog.HandlerOptions{
-			Level: slog.LevelInfo,
+			Level:       slog.LevelInfo,
+			ReplaceAttr: replaceAttr,
 		}))
 		closers = append(closers, close)
 	}
@@ -106,4 +121,46 @@ func initializeLogger(logFile string) (*slog.Logger, closeFunc, error) {
 		return errors.Join(errs...)
 	}
 	return slog.New(slog.NewMultiHandler(handlers...)), closer, nil
+}
+
+func replaceAttr(groups []string, a slog.Attr) slog.Attr {
+	if a.Key == "error" {
+		err, ok := a.Value.Any().(error)
+		if !ok {
+			return a
+		}
+
+		if me, ok := errors.AsType[multiError](err); ok {
+			listErrors := me.Unwrap()
+			finalErrors := make([]slog.Attr, 0, len(listErrors))
+			for i, err := range listErrors {
+				attr := extractErrorAttrs(err)
+				finalErrors = append(finalErrors, slog.GroupAttrs(
+					fmt.Sprintf("error_%d", i+1),
+					attr...,
+				))
+			}
+			return slog.GroupAttrs("errors", finalErrors...)
+		}
+
+		attrs := extractErrorAttrs(err)
+		return slog.GroupAttrs("error", attrs...)
+	}
+	return a
+}
+
+func extractErrorAttrs(err error) []slog.Attr {
+	attrs := []slog.Attr{
+		slog.String("message", err.Error()),
+	}
+
+	attrs = append(attrs, linkoerr.Attrs(err)...)
+
+	if stackErr, ok := errors.AsType[stackTracer](err); ok {
+		attrs = append(attrs, slog.Attr{
+			Key:   "stack_trace",
+			Value: slog.StringValue(fmt.Sprintf("%+v", stackErr.StackTrace())),
+		})
+	}
+	return attrs
 }
