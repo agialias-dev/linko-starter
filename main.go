@@ -1,9 +1,7 @@
 package main
 
 import (
-	"bufio"
 	"context"
-	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -12,21 +10,9 @@ import (
 	"syscall"
 	"time"
 
-	pkgerr "github.com/pkg/errors"
-
-	"boot.dev/linko/internal/linkoerr"
+	"boot.dev/linko/internal/build"
 	"boot.dev/linko/internal/store"
 )
-
-type stackTracer interface {
-	error
-	StackTrace() pkgerr.StackTrace
-}
-
-type multiError interface {
-	error
-	Unwrap() []error
-}
 
 func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -41,6 +27,9 @@ func main() {
 }
 
 func run(ctx context.Context, cancel context.CancelFunc, httpPort int, dataDir string) int {
+	env := os.Getenv("ENV")
+	hostname, _ := os.Hostname()
+
 	logger, closeLogger, err := initializeLogger(os.Getenv("LINKO_LOG_FILE"))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to initialize logger: %v\n", err)
@@ -51,6 +40,13 @@ func run(ctx context.Context, cancel context.CancelFunc, httpPort int, dataDir s
 			fmt.Fprintf(os.Stderr, "Failed to close logger: %v\n", err)
 		}
 	}()
+
+	logger = logger.With(
+		slog.String("git_sha", build.GitSHA),
+		slog.String("build_time", build.BuildTime),
+		slog.String("env", env),
+		slog.String("hostname", hostname),
+	)
 
 	st, err := store.New(dataDir, logger)
 	if err != nil {
@@ -77,90 +73,4 @@ func run(ctx context.Context, cancel context.CancelFunc, httpPort int, dataDir s
 		return 1
 	}
 	return 0
-}
-
-type closeFunc func() error
-
-func initializeLogger(logFile string) (*slog.Logger, closeFunc, error) {
-	handlers := []slog.Handler{
-		slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
-			Level:       slog.LevelDebug,
-			ReplaceAttr: replaceAttr,
-		}),
-	}
-	closers := []closeFunc{}
-
-	if logFile != "" {
-		file, err := os.OpenFile(logFile, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o644)
-		if err != nil {
-			return nil, nil, fmt.Errorf("failed to open log file: %w", err)
-		}
-		bufferedFile := bufio.NewWriterSize(file, 8192)
-		close := func() error {
-			if err := bufferedFile.Flush(); err != nil {
-				return fmt.Errorf("failed to flush log file: %w", err)
-			}
-			if err := file.Close(); err != nil {
-				return fmt.Errorf("failed to close log file: %w", err)
-			}
-			return nil
-		}
-		handlers = append(handlers, slog.NewJSONHandler(bufferedFile, &slog.HandlerOptions{
-			Level:       slog.LevelInfo,
-			ReplaceAttr: replaceAttr,
-		}))
-		closers = append(closers, close)
-	}
-	closer := func() error {
-		var errs []error
-		for _, close := range closers {
-			if err := close(); err != nil {
-				errs = append(errs, err)
-			}
-		}
-		return errors.Join(errs...)
-	}
-	return slog.New(slog.NewMultiHandler(handlers...)), closer, nil
-}
-
-func replaceAttr(groups []string, a slog.Attr) slog.Attr {
-	if a.Key == "error" {
-		err, ok := a.Value.Any().(error)
-		if !ok {
-			return a
-		}
-
-		if me, ok := errors.AsType[multiError](err); ok {
-			listErrors := me.Unwrap()
-			finalErrors := make([]slog.Attr, 0, len(listErrors))
-			for i, err := range listErrors {
-				attr := extractErrorAttrs(err)
-				finalErrors = append(finalErrors, slog.GroupAttrs(
-					fmt.Sprintf("error_%d", i+1),
-					attr...,
-				))
-			}
-			return slog.GroupAttrs("errors", finalErrors...)
-		}
-
-		attrs := extractErrorAttrs(err)
-		return slog.GroupAttrs("error", attrs...)
-	}
-	return a
-}
-
-func extractErrorAttrs(err error) []slog.Attr {
-	attrs := []slog.Attr{
-		slog.String("message", err.Error()),
-	}
-
-	attrs = append(attrs, linkoerr.Attrs(err)...)
-
-	if stackErr, ok := errors.AsType[stackTracer](err); ok {
-		attrs = append(attrs, slog.Attr{
-			Key:   "stack_trace",
-			Value: slog.StringValue(fmt.Sprintf("%+v", stackErr.StackTrace())),
-		})
-	}
-	return attrs
 }

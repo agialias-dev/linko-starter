@@ -52,8 +52,6 @@ type attrError interface {
 	Attrs() []slog.Attr
 }
 
-// Attrs recursively extracts all logging attributes from an error chain. In the
-// case of duplicate keys, the outermost value takes precedence.
 func Attrs(err error) []slog.Attr {
 	var attrs []slog.Attr
 	for err != nil {
