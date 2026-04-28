@@ -6,8 +6,11 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
+	"slices"
 	"time"
 
 	"github.com/lmittmann/tint"
@@ -48,6 +51,8 @@ type closeFunc func() error
 
 const logContextKey contextKey = "log_context"
 
+var sensitiveKeys = []string{"password", "user", "key", "apikey", "secret", "pin", "creditcardno"}
+
 func (r *spyReadCloser) Read(p []byte) (int, error) {
 	n, err := r.ReadCloser.Read(p)
 	r.bytesRead += n
@@ -72,7 +77,26 @@ func httpError(ctx context.Context, w http.ResponseWriter, status int, err error
 	if logCtx, ok := ctx.Value(logContextKey).(*LogContext); ok {
 		logCtx.Error = err
 	}
+	if status == 401 || status == 403 || status >= 500 {
+		http.Error(w, http.StatusText(status), status)
+		return
+	}
 	http.Error(w, err.Error(), status)
+}
+
+func redactIP(addr string) string {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return host
+	}
+	if ip4 := ip.To4(); ip4 != nil {
+		return fmt.Sprintf("%d.%d.%d.x", ip4[0], ip4[1], ip4[2])
+	}
+	return ip.String()
 }
 
 func initializeLogger(logFile string) (*slog.Logger, closeFunc, error) {
@@ -120,27 +144,35 @@ func initializeLogger(logFile string) (*slog.Logger, closeFunc, error) {
 }
 
 func replaceAttr(groups []string, a slog.Attr) slog.Attr {
+
+	if slices.Contains(sensitiveKeys, a.Key) {
+		return slog.String(a.Key, "[REDACTED]")
+	}
+
+	if a.Value.Kind() == slog.KindString {
+		if u, err := url.Parse(a.Value.String()); err == nil {
+			if u.User != nil {
+				u.User = url.UserPassword("[REDACTED]", "[REDACTED]")
+				return slog.String(a.Key, u.String())
+			}
+		}
+	}
+
 	if a.Key == "error" {
 		err, ok := a.Value.Any().(error)
 		if !ok {
 			return a
 		}
 
-		if me, ok := errors.AsType[multiError](err); ok {
-			listErrors := me.Unwrap()
-			finalErrors := make([]slog.Attr, 0, len(listErrors))
-			for i, err := range listErrors {
-				attr := extractErrorAttrs(err)
-				finalErrors = append(finalErrors, slog.GroupAttrs(
-					fmt.Sprintf("error_%d", i+1),
-					attr...,
-				))
+		if multiErr, ok := errors.AsType[multiError](err); ok {
+			var errAttrs []slog.Attr
+			for i, e := range multiErr.Unwrap() {
+				errAttrs = append(errAttrs, slog.GroupAttrs(fmt.Sprintf("error_%d", i+1), extractErrorAttrs(e)...))
 			}
-			return slog.GroupAttrs("errors", finalErrors...)
+			return slog.GroupAttrs("errors", errAttrs...)
 		}
 
-		attrs := extractErrorAttrs(err)
-		return slog.GroupAttrs("error", attrs...)
+		return slog.GroupAttrs("error", extractErrorAttrs(err)...)
 	}
 	return a
 }
@@ -181,7 +213,7 @@ func requestLogger(logger *slog.Logger) func(http.Handler) http.Handler {
 			reqAttrs = append(reqAttrs,
 				slog.String("method", r.Method),
 				slog.String("path", r.URL.Path),
-				slog.String("client_ip", r.RemoteAddr),
+				slog.String("client_ip", redactIP(r.RemoteAddr)),
 				slog.Duration("duration", time.Since(start)),
 				slog.Int("request_body_bytes", spyReader.bytesRead),
 				slog.Int("response_status", spyWriter.statusCode),
