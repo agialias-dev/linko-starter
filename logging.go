@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"slices"
+	"strconv"
 	"time"
 
 	"github.com/lmittmann/tint"
@@ -47,6 +48,11 @@ type spyResponseWriter struct {
 	statusCode   int
 }
 
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
 type closeFunc func() error
 
 const logContextKey contextKey = "log_context"
@@ -73,6 +79,11 @@ func (w *spyResponseWriter) WriteHeader(statusCode int) {
 	w.ResponseWriter.WriteHeader(statusCode)
 }
 
+func (r *statusRecorder) WriteHeader(code int) {
+	r.status = code
+	r.ResponseWriter.WriteHeader(code)
+}
+
 func httpError(ctx context.Context, w http.ResponseWriter, status int, err error) {
 	if logCtx, ok := ctx.Value(logContextKey).(*LogContext); ok {
 		logCtx.Error = err
@@ -97,6 +108,25 @@ func redactIP(addr string) string {
 		return fmt.Sprintf("%d.%d.%d.x", ip4[0], ip4[1], ip4[2])
 	}
 	return ip.String()
+}
+
+func metricsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rec := &statusRecorder{
+			ResponseWriter: w,
+			status:         http.StatusOK,
+		}
+
+		next.ServeHTTP(rec, r)
+
+		path := r.URL.Path
+		method := r.Method
+		status := strconv.Itoa(rec.status)
+
+		httpRequestsTotal.
+			WithLabelValues(method, path, status).
+			Inc()
+	})
 }
 
 func initializeLogger(logFile string) (*slog.Logger, closeFunc, error) {

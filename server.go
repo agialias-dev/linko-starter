@@ -10,6 +10,9 @@ import (
 	"os"
 
 	"boot.dev/linko/internal/store"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	prom "github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 type server struct {
@@ -18,6 +21,14 @@ type server struct {
 	logger     *slog.Logger
 	cancel     context.CancelFunc
 }
+
+var httpRequestsTotal = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: "http_requests_total",
+		Help: "Total number of HTTP requests.",
+	},
+	[]string{"method", "path", "status"},
+)
 
 func newServer(store store.Store, port int, logger *slog.Logger, cancel context.CancelFunc) *server {
 	mux := http.NewServeMux()
@@ -30,10 +41,11 @@ func newServer(store store.Store, port int, logger *slog.Logger, cancel context.
 
 	s.httpServer = &http.Server{
 		Addr:    fmt.Sprintf(":%d", port),
-		Handler: requestIDMiddleware(requestLogger(logger)(mux)),
+		Handler: metricsMiddleware(requestIDMiddleware(requestLogger(logger)(mux))),
 	}
 
 	mux.HandleFunc("GET /", s.handlerIndex)
+	mux.Handle("GET /metrics", prom.Handler())
 	mux.Handle("POST /api/login", s.authMiddleware(http.HandlerFunc(s.handlerLogin)))
 	mux.Handle("POST /api/shorten", s.authMiddleware(http.HandlerFunc(s.handlerShortenLink)))
 	mux.Handle("GET /api/stats", s.authMiddleware(http.HandlerFunc(s.handlerStats)))
