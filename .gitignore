@@ -4,3 +4,5 @@ linko
 vendor/
 *.log
 *.gz
+pprof/
+*.sh
