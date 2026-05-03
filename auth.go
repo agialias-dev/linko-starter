@@ -36,7 +36,7 @@ func (s *server) authMiddleware(next http.Handler) http.Handler {
 			httpError(r.Context(), w, http.StatusUnauthorized, fmt.Errorf("unauthorized"))
 			return
 		}
-		ok, err := s.validatePassword(password, stored)
+		ok, err := s.validatePassword(r.Context(), password, stored)
 		if err != nil {
 			s.logger.Error("error validating password",
 				slog.String("user", username),
@@ -67,7 +67,10 @@ func requestIDMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-func (s *server) validatePassword(password, stored string) (bool, error) {
+func (s *server) validatePassword(ctx context.Context, password, stored string) (bool, error) {
+	_, span := tracer.Start(ctx, "auth.validate_password")
+	defer span.End()
+
 	err := bcrypt.CompareHashAndPassword([]byte(stored), []byte(password))
 	if err == bcrypt.ErrMismatchedHashAndPassword {
 		return false, nil
